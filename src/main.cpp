@@ -60,35 +60,16 @@ QueueHandle_t motorQueue = NULL;
 // --- COMPONENT MOTOR CONTROL FUNCTIONS (Variable PWM Driven) ---
 // ============================================================================
 
-void updateDriveTrain(int brR, int brL, int rrR, int rrL, int lrR, int lrL, int flR, int flL) {
-    ledcWrite(CH_BR_R, brR); ledcWrite(CH_BR_L, brL);
-    ledcWrite(CH_RR_R, rrR); ledcWrite(CH_RR_L, rrL);
-    ledcWrite(CH_LR_R, lrR); ledcWrite(CH_LR_L, lrL);
-    ledcWrite(CH_FL_R, flR); ledcWrite(CH_FL_L, flL);
+void writeMotorChannel(uint8_t chanR, uint8_t chanL, int targetSpeed) {
+    if (targetSpeed >= 0) { ledcWrite(chanR, targetSpeed); ledcWrite(chanL, 0); } 
+    else { ledcWrite(chanR, 0); ledcWrite(chanL, abs(targetSpeed)); }
 }
 
-void stopMotors() {
-    updateDriveTrain(0, 0, 0, 0, 0, 0, 0, 0);
+void stopAllMotors() {
+    writeMotorChannel(CH_BR_R, CH_BR_L, 0); writeMotorChannel(CH_RR_R, CH_RR_L, 0);
+    writeMotorChannel(CH_LR_R, CH_LR_L, 0); writeMotorChannel(CH_FL_R, CH_FL_L, 0);
 }
 
-// Drive states adapt automatically to the speed intensity requested by Node A
-void moveForward(int speed) {
-    updateDriveTrain(speed, 0, speed, 0, speed, 0, speed, 0);
-}
-
-void moveBackward(int speed) {
-    updateDriveTrain(0, speed, 0, speed, 0, speed, 0, speed);
-}
-
-void pivotLeft(int speed) {
-    // Right side forward, Left side backward
-    updateDriveTrain(speed, 0, speed, 0, 0, speed, 0, speed);
-}
-
-void pivotRight(int speed) {
-    // Left side forward, Right side backward
-    updateDriveTrain(0, speed, 0, speed, speed, 0, speed, 0);
-}
 
 // ============================================================================
 // --- NETWORK DATA INTERCEPT HOOK (Fixed for older framework support) ---
@@ -113,41 +94,39 @@ void vTaskMotorController(void *pvParameters) {
     tx_message_t input;
     
     for (;;) {
-        // Blocks efficiently with 0% CPU consumption until Node B forwards a packet
         if (xQueueReceive(motorQueue, &input, portMAX_DELAY) == pdPASS) {
             
-            int speed = input.intensity; // Scaled 0-255 PWM value
-            int xOffset = input.joyX - JOY_CENTER;
-            int yOffset = input.joyY - JOY_CENTER;
+            // ANTIPARALLEL INTERLOCK INTERCEPT:
+            // If gimbal mode is active, the drive system is automatically killed.
+            if (input.btnState) {
+                stopAllMotors();
+                continue; 
+            }
 
-            // Direct hardware fallback: if stick is at rest, turn off all drivers
-            if (speed == 0 || (abs(xOffset) < JOY_DEADZONE && abs(yOffset) < JOY_DEADZONE)) {
-                stopMotors();
+            int moveForce = input.joyY - JOY_CENTER; 
+            int turnForce = input.joyX - JOY_CENTER;
+
+            if (abs(moveForce) < JOY_DEADZONE && abs(turnForce) < JOY_DEADZONE) {
+                stopAllMotors();
                 continue;
             }
 
-            // Direction parsing algorithm based on maximum absolute deflection vector
-            if (abs(yOffset) >= abs(xOffset)) {
-                // Dominant vertical axis movement
-                if (yOffset > 0) {
-                    moveBackward(speed); // Adapt orientation bounds if inverted
-                    Serial.printf("[DRIVE] Backward Speed: %d\n", speed);
-                } else {
-                    moveForward(speed);
-                    Serial.printf("[DRIVE] Forward Speed: %d\n", speed);
-                }
-            } else {
-                // Dominant horizontal axis movement
-                if (xOffset > 0) {
-                    pivotRight(speed);
-                    Serial.printf("[DRIVE] Pivoting Right Speed: %d\n", speed);
-                } else {
-                    pivotLeft(speed);
-                    Serial.printf("[DRIVE] Pivoting Left Speed: %d\n", speed);
-                }
-            }
+            int targetDrive = map(moveForce, -1875, 2220, -255, 255);
+            int targetSteer = map(turnForce, -1875, 2220, -255, 255);
+
+            int leftSpeed  = targetDrive + targetSteer;
+            int rightSpeed = targetDrive - targetSteer;
+
+            leftSpeed  = constrain(leftSpeed, -255, 255);
+            rightSpeed = constrain(rightSpeed, -255, 255);
+
+            writeMotorChannel(CH_BR_R, CH_BR_L, rightSpeed);
+            writeMotorChannel(CH_RR_R, CH_RR_L, rightSpeed);
+            writeMotorChannel(CH_LR_R, CH_LR_L, leftSpeed);
+            writeMotorChannel(CH_FL_R, CH_FL_L, leftSpeed);
         }
     }
+    
 }
 
 // ============================================================================
@@ -169,7 +148,7 @@ void setup() {
     ledcSetup(CH_FL_R, MOTOR_FREQ, MOTOR_RES); ledcSetup(CH_FL_L, MOTOR_FREQ, MOTOR_RES);
 
     // Emergency physical state isolation at startup
-    stopMotors();
+    stopAllMotors();
 
     // Boot Up Networking Layer
     WiFi.mode(WIFI_STA);
